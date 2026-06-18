@@ -1,0 +1,14 @@
+{
+  "name": "stratus",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "altcha-lib": "^2.2.0",
+    "chalk": "^4.1.2",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
