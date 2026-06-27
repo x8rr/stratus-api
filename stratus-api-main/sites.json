@@ -1,0 +1,18 @@
+{
+  "sites": {
+    "main": {
+      "api_key": "sk_live_name_here",
+      "enabled": true,
+      "max_concurrent_sessions": 9999999999999999,
+      "max_session_seconds": 900,
+      "limits": {
+    "per_minute": 99999999999,
+        "per_hour": 99999999,
+        "per_day": 999999999999,
+        "per_month": 999999999999999999999
+      }
+    }
+  }
+}
+
+// feel free to configure these
