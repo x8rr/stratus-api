@@ -12,5 +12,5 @@ bun run dev
 ```sh
 cd stratus-api-main
 bun i # or whatever pkg manager you use
-bun 
+bun api.js
 ```
