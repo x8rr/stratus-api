@@ -1,6 +1,8 @@
 # stratus api
 api is in /stratus-api-main/
+
 docs are in /src/
+
 find game keys in cloud.json
 
 ## running the website (with docs)
