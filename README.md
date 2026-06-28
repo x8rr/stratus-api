@@ -20,3 +20,5 @@ cd stratus-api-main
 bun i # or whatever pkg manager you use
 bun api.js
 ```
+
+most original code created by technonyte
