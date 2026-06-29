@@ -1,7 +1,7 @@
 # stratus api
-api is in /stratus-api-main/
+api is in /api/
 
-docs are in /src/
+docs and website are in /src/
 
 find game keys in cloud.json
 
@@ -16,7 +16,7 @@ bun run dev
 2. set your limits if you want
 3. run the following
 ```sh
-cd stratus-api-main
+cd api
 bun i # or whatever pkg manager you use
 bun api.js
 ```
