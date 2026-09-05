@@ -1,6 +1,6 @@
-MIT License
+Stratus Public License
 
-Copyright (c) 2026 hvtrs
+Copyright (c) 2026 hvtrs and technonyte00
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11,6 +11,18 @@ furnished to do so, subject to the following conditions:
 
 The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
+
+Any public-facing website that uses the Software must display the following
+notice in a reasonably visible location accessible to ordinary users:
+
+"This website uses Stratus API to provide some of its services"
+
+The notice must not be removed, hidden, obscured, or made intentionally
+difficult for ordinary users to find.
+
+Use of the Software does not require the source code of the website,
+application, service, modifications, or derivative works to be disclosed or
+made publicly available.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
