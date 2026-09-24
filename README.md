@@ -35,7 +35,10 @@ malq is a self-hosted disposable mail service that stratus uses to receive Racco
 
 **Get the source**
 
-malq is a separate service. Once you have the source, work from its root directory (the folder that contains `src/main.ts`).
+```sh
+git clone https://github.com/VillainsRule/malq
+cd malq
+```
 
 **Install and run**
 
