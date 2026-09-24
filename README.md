@@ -43,7 +43,6 @@ cd malq
 **Install and run**
 
 ```sh
-cd services/malq
 bun install
 bun src/main.ts        # binds to 127.0.0.1:4400
 ```
