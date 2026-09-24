@@ -56,24 +56,6 @@ pm2 save
 
 > **Do not use pm2's ecosystem `env` block to set `MALQ_ONLY_PROVIDER`** unless you deliberately want to pin to one provider — it silently overrides the full provider pool.
 
-**Check which providers are working**
-
-`providerCheck` tests every provider's API reachability from your host:
-
-```sh
-bun tests/providerCheck.ts
-bun tests/providerCheck.ts --write   # updates src/working-providers.ts
-```
-
-`raccoonCheck` tests which providers RaccoonGame actually accepts (some domains are blocklisted):
-
-```sh
-bun tests/raccoonCheck.ts
-bun tests/raccoonCheck.ts --write   # removes blocked providers from the list
-```
-
-Run both after deploying to a new host — provider reachability varies by network, and Raccoon's blocklist changes over time. The `--write` flag updates `src/working-providers.ts`, which malq reads at startup to decide which providers to load.
-
 **Custom domain (optional but reliable)**
 
 If you control a domain, you can add it as a provider and it will never be blocked. Add a `src/providers/impl/yourdomain.com.ts` using `src/providers/impl/cherrion.top.ts` as a template, set up Cloudflare Email Workers to relay inbound mail to malq's `/api/v1/inbound` endpoint, and add your domain to `src/working-providers.ts`.
