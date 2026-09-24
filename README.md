@@ -22,14 +22,59 @@ When a user starts a game the pool hands over a ready token immediately. If the 
 
 ## dependencies
 
-- **malq** running on `127.0.0.1:4400` — self-hosted disposable mail service, see [`services/malq/`](../cherri-v3/services/malq/).
+- **malq** running on `127.0.0.1:4400` — self-hosted disposable mail service (see below).
 - **`ws`** — WebSocket client for the RaccoonGame signalling relay.
 
 ```
-npm install ws
-# or
 bun add ws
 ```
+
+## setting up malq
+
+malq is a self-hosted disposable mail service that stratus uses to receive RaccoonGame's verification emails. It ships with ~40 provider backends and picks one at random per account creation.
+
+**Get the source**
+
+malq lives in [cherri-v3](https://github.com/genericness/cherri-v3) at `services/malq/`. Clone that repo and work from `services/malq/`.
+
+**Install and run**
+
+```sh
+cd services/malq
+bun install
+bun src/main.ts        # binds to 127.0.0.1:4400
+```
+
+Or with pm2 (recommended for production):
+
+```sh
+pm2 start bun --name malq -- src/main.ts
+pm2 save
+```
+
+> **Do not use pm2's ecosystem `env` block to set `MALQ_ONLY_PROVIDER`** unless you deliberately want to pin to one provider — it silently overrides the full provider pool.
+
+**Check which providers are working**
+
+`providerCheck` tests every provider's API reachability from your host:
+
+```sh
+bun tests/providerCheck.ts
+bun tests/providerCheck.ts --write   # updates src/working-providers.ts
+```
+
+`raccoonCheck` tests which providers RaccoonGame actually accepts (some domains are blocklisted):
+
+```sh
+bun tests/raccoonCheck.ts
+bun tests/raccoonCheck.ts --write   # removes blocked providers from the list
+```
+
+Run both after deploying to a new host — provider reachability varies by network, and Raccoon's blocklist changes over time. The `--write` flag updates `src/working-providers.ts`, which malq reads at startup to decide which providers to load.
+
+**Custom domain (optional but reliable)**
+
+If you control a domain, you can add it as a provider and it will never be blocked. Add a `src/providers/impl/yourdomain.com.ts` using `src/providers/impl/cherrion.top.ts` as a template, set up Cloudflare Email Workers to relay inbound mail to malq's `/api/v1/inbound` endpoint, and add your domain to `src/working-providers.ts`.
 
 ## integrating into your server
 
