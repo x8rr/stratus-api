@@ -35,7 +35,7 @@ malq is a self-hosted disposable mail service that stratus uses to receive Racco
 
 **Get the source**
 
-malq lives in [cherri-v3](https://github.com/genericness/cherri-v3) at `services/malq/`. Clone that repo and work from `services/malq/`.
+malq is a separate service. Once you have the source, work from its root directory (the folder that contains `src/main.ts`).
 
 **Install and run**
 
