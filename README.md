@@ -1,6 +1,6 @@
 # stratus-api
 
-Cloud gaming backend for [RaccoonGame](https://www.raccoongame.com). Handles account creation, the session pool, WebRTC signalling proxy, and queue management. Used in production by [cherri](https://cherri.gg).
+Cloud gaming backend for [RaccoonGame](https://www.raccoongame.com). Handles account creation, the session pool, WebRTC signalling proxy, and queue management. Used in production by [cherri](https://cherrion.top/), opium, bull33, ghostOS, and more.
 
 ## what's in here
 
