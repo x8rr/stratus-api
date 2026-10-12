@@ -8,6 +8,7 @@
 const { randomUUID, createDecipheriv } = require("crypto");
 const { WebSocket } = require("ws");
 const dns = require("dns");
+const sharp = require("sharp");
 
 if (!globalThis.crypto) globalThis.crypto = require("crypto").webcrypto;
 
@@ -372,6 +373,131 @@ async function raccoonStep(label, pathAndQuery, opts, deadline) {
 // new session (new random provider) is one HTTP call and cheap by
 // comparison, so it's worth one retry before giving up.
 const MAX_MAIL_ATTEMPTS = 3;
+const MAX_CAPTCHA_ATTEMPTS = 3;
+
+// ── Puzzle captcha solver ──────────────────────────────────────────────────
+// Finds the gap by looking for the region that is darkest relative to its
+// immediate surroundings (the puzzle-piece shadow). Uses an integral image
+// so the 2D sliding-window scan is O(w*h) total.
+async function findGapOffset(bgBuffer) {
+  const raw = await sharp(bgBuffer).grayscale().raw().toBuffer({ resolveWithObject: true });
+  const w = raw.info.width, h = raw.info.height;
+  const data = raw.data;
+
+  // Integral image for O(1) rectangle sums.
+  const iw = w + 1;
+  const I = new Float64Array(iw * (h + 1));
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      I[(y + 1) * iw + (x + 1)] =
+        data[y * w + x] + I[y * iw + (x + 1)] + I[(y + 1) * iw + x] - I[y * iw + x];
+    }
+  }
+  function rectSum(x1, y1, x2, y2) {
+    return I[(y2 + 1) * iw + (x2 + 1)] - I[y1 * iw + (x2 + 1)] - I[(y2 + 1) * iw + x1] + I[y1 * iw + x1];
+  }
+
+  const gW = Math.round(w * 0.16);
+  const gH = Math.round(h * 0.35);
+  const pad = Math.round(gW * 0.35);
+  const startX = Math.floor(w * 0.15);
+
+  let bestX = startX, bestContrast = -Infinity;
+  for (let x = startX; x <= w - gW; x++) {
+    for (let y = pad; y <= h - gH - pad; y++) {
+      const innerArea = gW * gH;
+      const innerSum = rectSum(x, y, x + gW - 1, y + gH - 1);
+
+      const ox1 = Math.max(0, x - pad);
+      const oy1 = Math.max(0, y - pad);
+      const ox2 = Math.min(w - 1, x + gW + pad - 1);
+      const oy2 = Math.min(h - 1, y + gH + pad - 1);
+      const outerSum = rectSum(ox1, oy1, ox2, oy2);
+      const borderArea = (ox2 - ox1 + 1) * (oy2 - oy1 + 1) - innerArea;
+      if (borderArea <= 0) continue;
+
+      const contrast = (outerSum - innerSum) / borderArea - innerSum / innerArea;
+      if (contrast > bestContrast) {
+        bestContrast = contrast;
+        bestX = x;
+      }
+    }
+  }
+  return bestX;
+}
+
+async function solveRegistrationCaptcha(email, sn, headers, base, deadline) {
+  for (let attempt = 1; attempt <= MAX_CAPTCHA_ATTEMPTS; attempt++) {
+    const budget = deadline - Date.now();
+    if (budget <= 0) throw new Error("captcha: account creation budget exhausted");
+
+    const now = Date.now();
+    const qs = new URLSearchParams({
+      t: String(now),
+      email,
+      sn,
+      _: String(now - Math.floor(Math.random() * 500)),
+    });
+    const captchaRes = await raccoonStep(
+      "getCaptcha",
+      `/users/emailRegisterCaptcha?${qs}`,
+      { method: "GET", headers },
+      deadline,
+    );
+
+    const challengeId = captchaRes?.data?.challenge_id;
+    const bgDataUri = captchaRes?.data?.background;
+
+    if (!challengeId) {
+      logApi(`captcha: attempt ${attempt} — no challenge_id in response: ${JSON.stringify(captchaRes).slice(0, 300)}`);
+      if (attempt < MAX_CAPTCHA_ATTEMPTS) continue;
+      throw new Error("captcha: no challenge_id returned");
+    }
+    if (!bgDataUri) {
+      logApi(`captcha: attempt ${attempt} — no background in response`);
+      if (attempt < MAX_CAPTCHA_ATTEMPTS) continue;
+      throw new Error("captcha: no background image returned");
+    }
+
+    logApi(`captcha: challenge ${challengeId.slice(0, 8)}… — solving`);
+
+    const base64Data = bgDataUri.replace(/^data:image\/\w+;base64,/, "");
+    const bgBuffer = Buffer.from(base64Data, "base64");
+
+    const offset = await findGapOffset(bgBuffer);
+    logApi(`captcha: solved — offset ${offset}`);
+
+    const verifyRes = await raccoonStep(
+      "captchaVerify",
+      "/users/emailRegisterCaptchaVerify",
+      {
+        method: "POST",
+        headers,
+        body: new URLSearchParams({
+          email,
+          sn,
+          challenge_id: challengeId,
+          offset: String(offset),
+        }),
+      },
+      deadline,
+    );
+
+    if (verifyRes?.status === 200 || verifyRes?.status === 201) {
+      logApi(`captcha: verified on attempt ${attempt}`);
+      return;
+    }
+
+    logApi(
+      `captcha: attempt ${attempt} rejected — ${JSON.stringify(verifyRes).slice(0, 200)}`,
+    );
+    if (attempt >= MAX_CAPTCHA_ATTEMPTS) {
+      throw new Error(
+        `captcha: failed after ${MAX_CAPTCHA_ATTEMPTS} attempts — last: ${JSON.stringify(verifyRes).slice(0, 200)}`,
+      );
+    }
+  }
+}
 
 async function createAccountRaw() {
   const startedAt = Date.now();
@@ -402,6 +528,8 @@ async function createAccountRaw() {
     email = session?.address;
     const mailToken = session?.token;
     if (!email || !mailToken) throw new Error("malq returned no session");
+
+    await solveRegistrationCaptcha(email, sn, h, base, deadline);
 
     await raccoonStep(
       "sendEmail",
@@ -908,5 +1036,6 @@ module.exports = {
   killSession,
   resetPingTimeout,
   connectRaccoonSignaling,
+  findGapOffset,
   logApi,
 };
