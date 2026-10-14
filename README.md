@@ -1,3 +1,5 @@
+stratus will not be receiving constant maintenance now, as scraping raccoongame is not worth it anymore. it used to be, back when they had zero protection and offered a generous 19 minute free limit, but they have since decreased the limit by 10 minutes and added relentless and unstable protections. i will try to add support for these, but the bypass has now gone from a side-project to a side-side-project.
+
 # stratus-api
 
 Cloud gaming backend for [RaccoonGame](https://www.raccoongame.com). Handles account creation, the session pool, WebRTC signalling proxy, and queue management. Used in production by [cherri](https://cherrion.top/), opium, bull33, ghostOS, and more.
