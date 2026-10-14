@@ -28,6 +28,78 @@ const RACCOON_HOST = "www.raccoongame.com";
 const RACCOON_TIMEOUT_MS = 20_000;
 let raccoonIpCache = null; // { ip, family, expiresAt }
 
+// Proxy rotation — each account creation uses a random proxy so captcha rate
+// limits don't accumulate on a single IP.  Proxies are fetched from public
+// SOCKS5 lists on startup, refreshed every 30 minutes.  Override with
+// RACCOON_PROXIES env (comma-separated) or a proxies.txt next to this file.
+const PROXY_SOURCES = [
+  "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all&simplified=true",
+  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+];
+
+let raccoonProxies = [];
+
+async function fetchFreshProxies() {
+  if (process.env.RACCOON_PROXIES) {
+    raccoonProxies = process.env.RACCOON_PROXIES.split(",").map((s) => s.trim()).filter(Boolean);
+    return;
+  }
+  try {
+    const path = require("path");
+    const fs = require("fs");
+    const txt = fs.readFileSync(path.join(__dirname, "proxies.txt"), "utf8");
+    const list = txt.split("\n").map((s) => s.trim()).filter((s) => s && !s.startsWith("#"));
+    if (list.length) {
+      raccoonProxies = list;
+      logApi(`loaded ${list.length} proxies from proxies.txt`);
+      return;
+    }
+  } catch {}
+
+  const fresh = new Set();
+  await Promise.allSettled(
+    PROXY_SOURCES.map(async (src) => {
+      try {
+        const res = await fetch(src, { signal: AbortSignal.timeout(8000) });
+        const text = await res.text();
+        for (const line of text.split(/\r?\n/)) {
+          const t = line.trim();
+          if (/^\d+\.\d+\.\d+\.\d+:\d+$/.test(t)) fresh.add(`http://${t}`);
+        }
+      } catch {}
+    }),
+  );
+  raccoonProxies = [...fresh];
+  if (raccoonProxies.length)
+    logApi(`fetched ${raccoonProxies.length} HTTP proxies`);
+  else
+    logApi("warning: no proxies loaded — signups will use direct connection");
+}
+
+const USE_PROXIES = !!process.env.ENABLE_PROXIES;
+const proxiesReady = USE_PROXIES ? fetchFreshProxies() : Promise.resolve();
+if (USE_PROXIES) setInterval(() => fetchFreshProxies(), 30 * 60_000).unref?.();
+
+const deadProxies = new Set();
+
+function pickProxy() {
+  const live = raccoonProxies.filter((p) => !deadProxies.has(p));
+  if (!live.length) {
+    if (deadProxies.size) {
+      logApi(`all ${deadProxies.size} tested proxies dead — clearing blacklist`);
+      deadProxies.clear();
+      return raccoonProxies[Math.floor(Math.random() * raccoonProxies.length)];
+    }
+    return undefined;
+  }
+  return live[Math.floor(Math.random() * live.length)];
+}
+
+function killProxy(proxy) {
+  deadProxies.add(proxy);
+}
+
 async function resolveRaccoonIp() {
   if (raccoonIpCache && raccoonIpCache.expiresAt > Date.now())
     return raccoonIpCache;
@@ -53,8 +125,10 @@ async function resolveRaccoonIp() {
 async function fetchWithTimeout(url, opts = {}, ms = RACCOON_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
+  const fetchOpts = { ...opts, signal: ctrl.signal };
+  if (opts.proxy) fetchOpts.tls = { rejectUnauthorized: false };
   try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
+    return await fetch(url, fetchOpts);
   } finally {
     clearTimeout(timer);
   }
@@ -64,7 +138,9 @@ async function fetchWithTimeout(url, opts = {}, ms = RACCOON_TIMEOUT_MS) {
 // ceiling; without it the literal-address attempt plus the hostname retry can
 // spend 2 × RACCOON_TIMEOUT_MS on a single step.
 async function raccoonFetch(pathAndQuery, opts = {}) {
-  const { timeoutMs = RACCOON_TIMEOUT_MS, ...rest } = opts;
+  const defaultTimeout = opts.proxy ? PROXY_TIMEOUT_MS : RACCOON_TIMEOUT_MS;
+  const { timeoutMs: requestedMs = defaultTimeout, ...rest } = opts;
+  const timeoutMs = opts.proxy ? Math.min(requestedMs, PROXY_TIMEOUT_MS) : requestedMs;
   const entry = await resolveRaccoonIp();
   if (!entry)
     return fetchWithTimeout(`https://${RACCOON_HOST}${pathAndQuery}`, rest, timeoutMs);
@@ -120,6 +196,86 @@ async function mailFetch(pathAndQuery, opts = {}, ms = MAIL_TIMEOUT_MS) {
       `malq ${pathAndQuery} → non-JSON body: ${body.slice(0, 160)}`,
     );
   }
+}
+
+// ── temp.tf (Gmail dot-trick addresses — not flagged as disposable) ───────
+const TEMPTF_HOST = "https://temp.tf/api";
+const TEMPTF_TIMEOUT_MS = 10_000;
+
+async function temptfGetAddress() {
+  const res = await fetchWithTimeout(
+    `${TEMPTF_HOST}/account?dot=1&providers=gmail`,
+    {},
+    TEMPTF_TIMEOUT_MS,
+  );
+  const body = await res.text();
+  if (!res.ok)
+    throw new Error(`temp.tf /account → HTTP ${res.status} ${body.slice(0, 160)}`);
+  const data = JSON.parse(body);
+  if (!data.email) throw new Error("temp.tf returned no email");
+  return data.email;
+}
+
+async function temptfCheckInbox(email, deadline, sentAfter) {
+  const until = Math.min(
+    deadline ?? Date.now() + VERIFY_TIMEOUT_MS,
+    Date.now() + VERIFY_TIMEOUT_MS,
+  );
+  const startedAt = Date.now();
+  const cutoff = (sentAfter || startedAt) - 60_000;
+  let attempts = 0;
+  let lastError = null;
+  let wait = VERIFY_POLL_MIN_MS;
+
+  for (;;) {
+    attempts++;
+    try {
+      const res = await fetchWithTimeout(
+        `${TEMPTF_HOST}/check`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email }),
+        },
+        TEMPTF_TIMEOUT_MS,
+      );
+      if (res.status === 429) {
+        const retryAfter = (Number(res.headers.get("retry-after")) || 5) * 1000;
+        wait = Math.max(wait, retryAfter);
+        logApi(`verify: temp.tf 429, waiting ${Math.ceil(retryAfter / 1000)}s`);
+      } else if (res.ok) {
+        const data = JSON.parse(await res.text());
+        for (const msg of (data?.data || []).slice(0, VERIFY_MAX_MESSAGES)) {
+          const msgDate = msg?.date ? new Date(msg.date).getTime() : 0;
+          if (msgDate < cutoff) continue;
+          const text = [msg?.subject, msg?.body].filter(Boolean).join(" ");
+          const match = text.match(/\b\d{6}\b/);
+          if (match) {
+            logApi(`verify: found code ${match[0]} in msg from ${msg.date}`);
+            return match[0];
+          }
+        }
+      } else {
+        const body = await res.text();
+        lastError = new Error(`temp.tf /check → HTTP ${res.status} ${body.slice(0, 160)}`);
+        logApi(`verify: check ${attempts} failed — ${lastError.message}`);
+      }
+    } catch (e) {
+      lastError = e;
+      logApi(`verify: check ${attempts} failed — ${e.message}`);
+    }
+    const remaining = until - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(wait, remaining)));
+    wait = Math.min(Math.round(wait * 1.5), VERIFY_POLL_MAX_MS);
+  }
+
+  const secs = Math.round((Date.now() - startedAt) / 1000);
+  throw new Error(
+    lastError
+      ? `Verification code never arrived after ${secs}s (${attempts} checks) — last: ${lastError.message}`
+      : `Verification code never arrived after ${secs}s (${attempts} checks) — inbox stayed empty`,
+  );
 }
 
 const MAX_SESSION_SECONDS = 20 * 60;
@@ -239,6 +395,8 @@ let poolRetryMs = POOL_RETRY_MIN_MS;
 let poolRetryTimer = null;
 let poolRetryAt = 0;
 let lastPoolError = null;
+let captchaCooldownUntil = 0;
+const proxyCooldowns = new Map(); // proxy URL → cooldown timestamp
 
 // The old fillPool() `break`s out on the first error and is only ever called
 // again when an account is consumed — so if upstream was down at startup the
@@ -270,7 +428,11 @@ async function fillPool() {
         logApi(`pool: ready (${pool.length}/${POOL_TARGET})`);
       } catch (e) {
         lastPoolError = e.message;
-        const retryMs = e.service === "malq" ? POOL_LOCAL_MAIL_RETRY_MS : poolRetryMs;
+        const retryMs = e.service === "malq"
+          ? POOL_LOCAL_MAIL_RETRY_MS
+          : e.retryAfterMs
+            ? Math.max(e.retryAfterMs, poolRetryMs)
+            : poolRetryMs;
         logApi(
           `pool: fill error — ${e.message}; retrying in ${Math.round(retryMs / 1000)}s`,
         );
@@ -314,7 +476,13 @@ async function createAccount() {
     // Don't immediately re-attempt a fill through the same failing upstream —
     // that just burns the rate limit the next user needs.
     lastPoolError = e.message;
-    scheduleRefill(e.service === "malq" ? POOL_LOCAL_MAIL_RETRY_MS : poolRetryMs);
+    scheduleRefill(
+      e.service === "malq"
+        ? POOL_LOCAL_MAIL_RETRY_MS
+        : e.retryAfterMs
+          ? Math.max(e.retryAfterMs, poolRetryMs)
+          : poolRetryMs,
+    );
     throw e;
   }
 }
@@ -358,10 +526,20 @@ async function raccoonStep(label, pathAndQuery, opts, deadline) {
     typeof data?.status === "number" &&
     data.status !== 200 &&
     data.status !== 201
-  )
-    throw new Error(
+  ) {
+    if (label === "emailRegister")
+      logApi(`emailRegister FULL response: ${body.slice(0, 500)}`);
+    const err = new Error(
       `${label} rejected — status ${data.status}${data.msg ? `: ${data.msg}` : ""}`,
     );
+    if (data.status === 429) {
+      const m = data.msg?.match(/try again in (\d+)/i);
+      err.retryAfterMs = m ? Number(m[1]) * 1000 : 60_000;
+      err.rateLimited = true;
+    }
+    throw err;
+  }
+  if (data) data._res = res;
   return data;
 }
 
@@ -373,18 +551,17 @@ async function raccoonStep(label, pathAndQuery, opts, deadline) {
 // new session (new random provider) is one HTTP call and cheap by
 // comparison, so it's worth one retry before giving up.
 const MAX_MAIL_ATTEMPTS = 3;
-const MAX_CAPTCHA_ATTEMPTS = 3;
+const MAX_CAPTCHA_ATTEMPTS = 5;
 
 // ── Puzzle captcha solver ──────────────────────────────────────────────────
-// Finds the gap by looking for the region that is darkest relative to its
-// immediate surroundings (the puzzle-piece shadow). Uses an integral image
-// so the 2D sliding-window scan is O(w*h) total.
-async function findGapOffset(bgBuffer) {
+// The captcha response includes piece_size and piece_y, so the search is 1D
+// (only x varies). Finds the gap by looking for the region that is darkest
+// relative to its immediate surroundings (the puzzle-piece shadow).
+async function findGapOffset(bgBuffer, pieceSize, pieceY) {
   const raw = await sharp(bgBuffer).grayscale().raw().toBuffer({ resolveWithObject: true });
   const w = raw.info.width, h = raw.info.height;
   const data = raw.data;
 
-  // Integral image for O(1) rectangle sums.
   const iw = w + 1;
   const I = new Float64Array(iw * (h + 1));
   for (let y = 0; y < h; y++) {
@@ -397,14 +574,16 @@ async function findGapOffset(bgBuffer) {
     return I[(y2 + 1) * iw + (x2 + 1)] - I[y1 * iw + (x2 + 1)] - I[(y2 + 1) * iw + x1] + I[y1 * iw + x1];
   }
 
-  const gW = Math.round(w * 0.16);
-  const gH = Math.round(h * 0.35);
+  const gW = pieceSize || Math.round(w * 0.16);
+  const gH = pieceSize || Math.round(h * 0.35);
   const pad = Math.round(gW * 0.35);
   const startX = Math.floor(w * 0.15);
 
   let bestX = startX, bestContrast = -Infinity;
+  const yFrom = pieceY != null ? pieceY : pad;
+  const yTo = pieceY != null ? pieceY : h - gH - pad;
   for (let x = startX; x <= w - gW; x++) {
-    for (let y = pad; y <= h - gH - pad; y++) {
+    for (let y = yFrom; y <= yTo; y++) {
       const innerArea = gW * gH;
       const innerSum = rectSum(x, y, x + gW - 1, y + gH - 1);
 
@@ -426,7 +605,19 @@ async function findGapOffset(bgBuffer) {
   return bestX;
 }
 
-async function solveRegistrationCaptcha(email, sn, headers, base, deadline) {
+async function solveRegistrationCaptcha(email, sn, headers, base, deadline, proxy) {
+  const cooldownKey = proxy || "_direct";
+  const cooldownUntil = proxy ? (proxyCooldowns.get(cooldownKey) || 0) : captchaCooldownUntil;
+  const cooldownRemaining = cooldownUntil - Date.now();
+  if (cooldownRemaining > 0) {
+    const err = new Error(
+      `getCaptcha rate-limited — ${Math.ceil(cooldownRemaining / 1000)}s remaining`,
+    );
+    err.rateLimited = true;
+    err.retryAfterMs = cooldownRemaining;
+    throw err;
+  }
+
   for (let attempt = 1; attempt <= MAX_CAPTCHA_ATTEMPTS; attempt++) {
     const budget = deadline - Date.now();
     if (budget <= 0) throw new Error("captcha: account creation budget exhausted");
@@ -438,12 +629,25 @@ async function solveRegistrationCaptcha(email, sn, headers, base, deadline) {
       sn,
       _: String(now - Math.floor(Math.random() * 500)),
     });
-    const captchaRes = await raccoonStep(
-      "getCaptcha",
-      `/users/emailRegisterCaptcha?${qs}`,
-      { method: "GET", headers },
-      deadline,
-    );
+    let captchaRes;
+    try {
+      captchaRes = await raccoonStep(
+        "getCaptcha",
+        `/users/emailRegisterCaptcha?${qs}`,
+        { method: "GET", headers, proxy },
+        deadline,
+      );
+    } catch (e) {
+      if (e.rateLimited) {
+        const cd = Date.now() + (e.retryAfterMs || 60_000);
+        if (proxy) proxyCooldowns.set(cooldownKey, cd);
+        else captchaCooldownUntil = cd;
+        logApi(
+          `captcha: rate-limited, cooldown ${Math.ceil((e.retryAfterMs || 60_000) / 1000)}s`,
+        );
+      }
+      throw e;
+    }
 
     const challengeId = captchaRes?.data?.challenge_id;
     const bgDataUri = captchaRes?.data?.background;
@@ -459,49 +663,109 @@ async function solveRegistrationCaptcha(email, sn, headers, base, deadline) {
       throw new Error("captcha: no background image returned");
     }
 
-    logApi(`captcha: challenge ${challengeId.slice(0, 8)}… — solving`);
+    const pieceSize = captchaRes?.data?.piece_size;
+    const pieceY = captchaRes?.data?.piece_y;
+
+    const cookies = captchaRes._res?.headers?.getSetCookie?.() || [];
+    const cookieStr = cookies.map((c) => c.split(";")[0]).join("; ");
+
+    logApi(`captcha: challenge ${challengeId.slice(0, 8)}… — solving (piece ${pieceSize}px @ y=${pieceY})`);
 
     const base64Data = bgDataUri.replace(/^data:image\/\w+;base64,/, "");
     const bgBuffer = Buffer.from(base64Data, "base64");
 
-    const offset = await findGapOffset(bgBuffer);
+    const offset = await findGapOffset(bgBuffer, pieceSize, pieceY);
     logApi(`captcha: solved — offset ${offset}`);
 
-    const verifyRes = await raccoonStep(
-      "captchaVerify",
-      "/users/emailRegisterCaptchaVerify",
-      {
-        method: "POST",
-        headers,
-        body: new URLSearchParams({
-          email,
-          sn,
-          challenge_id: challengeId,
-          offset: String(offset),
-        }),
-      },
-      deadline,
-    );
+    const verifyHeaders = { ...headers };
+    if (cookieStr) verifyHeaders.Cookie = cookieStr;
 
-    if (verifyRes?.status === 200 || verifyRes?.status === 201) {
-      logApi(`captcha: verified on attempt ${attempt}`);
-      return;
+    try {
+      const verifyRes = await raccoonStep(
+        "captchaVerify",
+        "/users/emailRegisterCaptchaVerify",
+        {
+          method: "POST",
+          headers: verifyHeaders,
+          proxy,
+          body: new URLSearchParams({
+            email,
+            sn,
+            challenge_id: challengeId,
+            offset: String(offset),
+          }),
+        },
+        deadline,
+      );
+
+      if (verifyRes?.status === 200 || verifyRes?.status === 201) {
+        logApi(`captcha: verified on attempt ${attempt} — data: ${JSON.stringify(verifyRes.data || verifyRes).slice(0, 300)}`);
+        const verifyCookies = verifyRes._res?.headers?.getSetCookie?.() || [];
+        if (verifyCookies.length) {
+          const extra = verifyCookies.map((c) => c.split(";")[0]).join("; ");
+          const merged = cookieStr ? `${cookieStr}; ${extra}` : extra;
+          logApi(`captcha: cookies merged (${merged.length} chars)`);
+          return merged;
+        }
+        return cookieStr;
+      }
+
+      logApi(
+        `captcha: attempt ${attempt} rejected — ${JSON.stringify(verifyRes).slice(0, 200)}`,
+      );
+    } catch (e) {
+      if (e.rateLimited) {
+        const cd = Date.now() + (e.retryAfterMs || 60_000);
+        if (proxy) proxyCooldowns.set(cooldownKey, cd);
+        else captchaCooldownUntil = cd;
+        logApi(
+          `captcha: rate-limited, cooldown ${Math.ceil((e.retryAfterMs || 60_000) / 1000)}s`,
+        );
+        throw e;
+      }
+      logApi(`captcha: attempt ${attempt} error — ${e.message}`);
     }
 
-    logApi(
-      `captcha: attempt ${attempt} rejected — ${JSON.stringify(verifyRes).slice(0, 200)}`,
-    );
     if (attempt >= MAX_CAPTCHA_ATTEMPTS) {
-      throw new Error(
-        `captcha: failed after ${MAX_CAPTCHA_ATTEMPTS} attempts — last: ${JSON.stringify(verifyRes).slice(0, 200)}`,
-      );
+      throw new Error(`captcha: failed after ${MAX_CAPTCHA_ATTEMPTS} attempts`);
     }
   }
+}
+
+const PROXY_TIMEOUT_MS = 8_000;
+const PROXY_CHECK_MS = 4_000;
+
+async function checkProxy(proxy) {
+  try {
+    await fetchWithTimeout(
+      `https://${RACCOON_HOST}/`,
+      { method: "HEAD", proxy, tls: { rejectUnauthorized: false } },
+      PROXY_CHECK_MS,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pickLiveProxy() {
+  if (!USE_PROXIES) return undefined;
+  for (let i = 0; i < 8; i++) {
+    const p = pickProxy();
+    if (!p) return undefined;
+    if (await checkProxy(p)) return p;
+    killProxy(p);
+    logApi(`proxy ${p.split("//")[1]} failed check — blacklisted`);
+  }
+  logApi("no live proxy found after 8 tries");
+  return undefined;
 }
 
 async function createAccountRaw() {
   const startedAt = Date.now();
   const deadline = startedAt + ACCOUNT_CREATE_TIMEOUT_MS;
+  let proxy = await pickLiveProxy();
+  if (proxy) logApi(`using proxy ${proxy.replace(/\/\/.*@/, "//***@")}`);
 
   const raccoonPassword = generatePassword();
   const sn = generateSN();
@@ -510,6 +774,8 @@ async function createAccountRaw() {
     "Content-Type": "application/x-www-form-urlencoded",
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0 Safari/537.36",
+    "Origin": `https://${RACCOON_HOST}`,
+    "Referer": `https://${RACCOON_HOST}/`,
   };
   const base = {
     sn,
@@ -520,72 +786,118 @@ async function createAccountRaw() {
     os: "web",
   };
 
-  let email, code, lastVerifyError;
-  for (let attempt = 1; attempt <= MAX_MAIL_ATTEMPTS; attempt++) {
-    // malq picks the domain/provider and creates the inbox itself; no
-    // separate account+password step like mail.tm required.
+  const useTempTf = !!process.env.USE_TEMPTF;
+  let email, mailToken;
+  if (useTempTf) {
+    email = await temptfGetAddress();
+    logApi(`mail: temp.tf → ${email}`);
+  } else {
     const session = await mailFetch("/api/v1/session");
     email = session?.address;
-    const mailToken = session?.token;
+    mailToken = session?.token;
     if (!email || !mailToken) throw new Error("malq returned no session");
+    logApi(`mail: malq → ${email}`);
+  }
 
-    await solveRegistrationCaptcha(email, sn, h, base, deadline);
+  const MAX_PROXY_RETRIES = 3;
+  let code;
+  const cookieJar = new Map();
 
-    await raccoonStep(
-      "sendEmail",
-      "/users/sendEmail",
-      {
-        method: "POST",
-        headers: h,
-        body: new URLSearchParams({ email, type: "register", ...base }),
-      },
-      deadline,
-    );
-
-    // A dead provider (a malq scraper throwing on every single poll, not a
-    // transient 429) will happily eat the entire remaining deadline before
-    // giving up, which left later attempts with no time at all. Split what's
-    // left evenly across the attempts still owed, so a provider that never
-    // answers can only cost its fair share.
-    const attemptsLeft = MAX_MAIL_ATTEMPTS - attempt + 1;
-    const attemptDeadline = Math.min(
-      deadline,
-      Date.now() + Math.floor((deadline - Date.now()) / attemptsLeft),
-    );
-
-    try {
-      code = await getVerificationCode(mailToken, attemptDeadline);
-      lastVerifyError = null;
-      break;
-    } catch (e) {
-      lastVerifyError = e;
-      if (attempt < MAX_MAIL_ATTEMPTS && Date.now() < deadline)
-        logApi(`mail: attempt ${attempt} failed (${e.message}) — trying a new provider`);
+  function mergeCookies(res) {
+    const setCookies = res?.headers?.getSetCookie?.() || [];
+    for (const c of setCookies) {
+      const nameVal = c.split(";")[0];
+      const eq = nameVal.indexOf("=");
+      if (eq > 0) cookieJar.set(nameVal.slice(0, eq).trim(), nameVal);
     }
   }
-  if (lastVerifyError) throw lastVerifyError;
 
-  await raccoonStep(
-    "emailRegister",
-    "/users/emailRegister",
-    {
-      method: "POST",
-      headers: h,
-      body: new URLSearchParams({
+  function headersWithCookies() {
+    if (!cookieJar.size) return h;
+    return { ...h, Cookie: [...cookieJar.values()].join("; ") };
+  }
+
+  for (let proxyTry = 0; proxyTry <= MAX_PROXY_RETRIES; proxyTry++) {
+    try {
+      cookieJar.clear();
+      const captchaCookies = await solveRegistrationCaptcha(email, sn, h, base, deadline, proxy);
+      if (captchaCookies) {
+        for (const part of captchaCookies.split("; ")) {
+          const eq = part.indexOf("=");
+          if (eq > 0) cookieJar.set(part.slice(0, eq).trim(), part);
+        }
+      }
+      logApi(`cookies after captcha: ${[...cookieJar.keys()].join(", ")} (${cookieJar.size} keys)`);
+
+      const sendEmailAt = Date.now();
+      const sendRes = await raccoonStep(
+        "sendEmail",
+        "/users/sendEmail",
+        {
+          method: "POST",
+          headers: headersWithCookies(),
+          proxy,
+          body: new URLSearchParams({ email, type: "register", ...base }),
+        },
+        deadline,
+      );
+      mergeCookies(sendRes?._res);
+
+      if (useTempTf) {
+        code = await temptfCheckInbox(email, deadline, sendEmailAt);
+      } else {
+        code = await getVerificationCode(mailToken, deadline);
+      }
+      logApi(`emailRegister: code=${code} email=${email} cookies=${cookieJar.size}`);
+
+      const regBody = new URLSearchParams({
         email,
         code,
         password: raccoonPassword,
         phone: "1",
         country: "Brazil",
         ...base,
-      }),
-    },
-    deadline,
-  );
+      });
+      logApi(`emailRegister body: ${regBody.toString().slice(0, 300)}`);
+
+      try {
+        const regRes = await raccoonFetch("/users/emailRegister", {
+          method: "POST",
+          headers: headersWithCookies(),
+          proxy,
+          body: regBody,
+          timeoutMs: Math.max(5_000, Math.min(RACCOON_TIMEOUT_MS, deadline - Date.now())),
+        });
+        const regRaw = await regRes.text();
+        logApi(`emailRegister response: ${regRaw.slice(0, 300)}`);
+        mergeCookies(regRes);
+      } catch (e) {
+        logApi(`emailRegister error (continuing to login): ${e.message}`);
+      }
+      break;
+    } catch (e) {
+      const isRaccoonError =
+        e.rateLimited ||
+        /puzzle does not match/i.test(e.message) ||
+        /Temporary email/i.test(e.message) ||
+        /captcha: failed after/i.test(e.message) ||
+        /budget exhausted/i.test(e.message);
+      const isProxyError = proxy && !isRaccoonError;
+      if (isProxyError && proxyTry < MAX_PROXY_RETRIES && Date.now() < deadline) {
+        logApi(`proxy ${proxy.split("//")[1]} dead — blacklisting, picking another`);
+        killProxy(proxy);
+        proxy = await pickLiveProxy();
+        if (proxy) logApi(`retrying with proxy ${proxy.replace(/\/\/.*@/, "//***@")}`);
+        continue;
+      }
+      throw e;
+    }
+  }
 
   const loginRes = await raccoonFetch("/users/emailLogin", {
     method: "POST",
-    headers: h,
+    headers: headersWithCookies(),
+    proxy,
     body: new URLSearchParams({ email, password: raccoonPassword, ...base }),
     timeoutMs: Math.max(5_000, Math.min(RACCOON_TIMEOUT_MS, deadline - Date.now())),
   });
@@ -1013,8 +1325,8 @@ function connectRaccoonSignaling(session) {
   raccoonWs.on("error", () => logApi(`signal error on ${uuid.slice(0, 8)}`));
 }
 
-// Warm the pool at startup so accounts are ready before the first user arrives.
-fillPool().catch(() => {});
+// Warm the pool at startup, but wait for proxy list first.
+proxiesReady.then(() => fillPool()).catch(() => {});
 
 module.exports = {
   WebSocket,
