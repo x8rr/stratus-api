@@ -2,7 +2,7 @@ stratus will not be receiving constant maintenance now, as scraping raccoongame 
 
 # stratus-api
 
-Cloud gaming backend for [RaccoonGame](https://www.raccoongame.com). Handles account creation, the session pool, WebRTC signalling proxy, and queue management. Used in production by [cherri](https://cherrion.top/), opium, bull33, ghostOS, and more.
+Cloud gaming backend for [RaccoonGame](https://www.raccoongame.com). Handles account creation, the session pool, WebRTC signalling proxy, and queue management. Used in production by [cherri](https://cherrion.top/), opium, bull33, ghostOS, truffled, t9os, and more.
 
 ## what's in here
 
